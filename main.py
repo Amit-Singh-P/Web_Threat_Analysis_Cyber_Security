@@ -26,11 +26,11 @@ except Exception:
     TF_AVAILABLE = False
 
 st.set_page_config(page_title="Web Threat Analysis", layout="wide")
-st.title("Web Threat Analysis — Streamlit App")
+st.title("Web Threat Analysis")
 
 # ---- Sidebar: Inputs ----
-st.sidebar.header("Upload / Settings")
-uploaded_file = st.sidebar.file_uploader("Upload CSV file (CloudWatch_Traffic_Web_Attack.csv)", type=["csv"])
+st.sidebar.header("Settings")
+# uploaded_file = st.sidebar.file_uploader("Upload CSV file (CloudWatch_Traffic_Web_Attack.csv)", type=["csv"])
 
 max_graph_nodes = st.sidebar.slider("Max nodes in network graph", min_value=20, max_value=300, value=80, step=10)
 train_nn = st.sidebar.checkbox("Also train TensorFlow Neural Network (if available)", value=False)
@@ -47,8 +47,8 @@ def safe_to_datetime(df, col):
 
 # ---- Data Loading & Preprocessing ----
 @st.cache_data(show_spinner=False)
-def load_and_transform(uploaded):
-    df = pd.read_csv(uploaded)
+def load_and_transform():
+    df = pd.read_csv(CloudWatch_Traffic_Web_Attack.csv)
     # Drop duplicate rows
     df = df.drop_duplicates().reset_index(drop=True)
 
