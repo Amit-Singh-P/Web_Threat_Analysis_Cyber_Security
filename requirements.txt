@@ -1,3 +1,7 @@
-matplotlib
+streamlit>=1.18.0
 pandas
 numpy
+scikit-learn
+matplotlib
+networkx
+# tensorflow  # optional: uncomment if you need TF (heavy, may exceed free Cloud limits)
