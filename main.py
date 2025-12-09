@@ -2,6 +2,7 @@
 import warnings
 warnings.filterwarnings("ignore")
 
+import os
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -12,8 +13,6 @@ from sklearn.preprocessing import StandardScaler, OneHotEncoder
 from sklearn.model_selection import train_test_split
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import classification_report, accuracy_score
-from sklearn.compose import ColumnTransformer
-from sklearn.pipeline import Pipeline
 
 # Try to import tensorflow, but keep app functional if it's not installed
 try:
@@ -28,16 +27,19 @@ except Exception:
 st.set_page_config(page_title="Web Threat Analysis", layout="wide")
 st.title("Web Threat Analysis")
 
-# ---- Sidebar: Inputs ----
-st.sidebar.header("Settings")
-# uploaded_file = st.sidebar.file_uploader("Upload CSV file (CloudWatch_Traffic_Web_Attack.csv)", type=["csv"])
+# ========== CONFIG: change DATA_PATH to point to your CSV inside the repo ==========
+# Example: put your file in a folder named `data` at repo root:
+DATA_PATH = "CloudWatch_Traffic_Web_Attack.csv"
+# ==================================================================================
 
+# ---- Sidebar: Settings ----
+st.sidebar.header("Settings")
 max_graph_nodes = st.sidebar.slider("Max nodes in network graph", min_value=20, max_value=300, value=80, step=10)
 train_nn = st.sidebar.checkbox("Also train TensorFlow Neural Network (if available)", value=False)
+random_state = st.sidebar.number_input("Random seed", min_value=0, max_value=9999, value=42)
+
 if train_nn and not TF_AVAILABLE:
     st.sidebar.warning("TensorFlow not available on the server. Neural network option will be disabled.")
-
-random_state = st.sidebar.number_input("Random seed", min_value=0, max_value=9999, value=42)
 
 # Utility: safe datetime conversion
 def safe_to_datetime(df, col):
@@ -45,11 +47,9 @@ def safe_to_datetime(df, col):
         return pd.to_datetime(df[col], errors='coerce')
     return pd.Series([], dtype="datetime64[ns]")
 
-# ---- Data Loading & Preprocessing ----
 @st.cache_data(show_spinner=False)
-def load_and_transform():
-    df = pd.read_csv(CloudWatch_Traffic_Web_Attack.csv)
-    # Drop duplicate rows
+def load_and_transform_from_path(path):
+    df = pd.read_csv(path)
     df = df.drop_duplicates().reset_index(drop=True)
 
     # Datetime conversions (safely)
@@ -89,14 +89,21 @@ def load_and_transform():
 
     return df
 
-if not uploaded_file:
-    st.info("Upload your CSV file in the sidebar to get started. Example filename: CloudWatch_Traffic_Web_Attack.csv")
-    st.stop()
+# Try to load from repo path
+if os.path.exists(DATA_PATH):
+    with st.spinner(f"Loading data from {DATA_PATH} ..."):
+        df = load_and_transform_from_path(DATA_PATH)
+else:
+    st.error(f"CSV file not found at repo path: `{DATA_PATH}`. Please add your CSV to that path in the repository.")
+    st.info("For testing you can still upload a CSV below (fallback).")
+    uploaded_file = st.file_uploader("Upload CSV file (fallback)", type=["csv"])
+    if not uploaded_file:
+        st.stop()
+    else:
+        with st.spinner("Loading uploaded CSV..."):
+            df = load_and_transform_from_path(uploaded_file)
 
-# Load data
-with st.spinner("Loading and processing data..."):
-    df = load_and_transform(uploaded_file)
-
+# Show basic preview
 st.header("Raw data preview")
 st.dataframe(df.head(200))
 
@@ -114,10 +121,10 @@ if not numeric_df.empty:
     ax.set_yticks(np.arange(len(corr.columns)))
     ax.set_xticklabels(corr.columns, rotation=45, ha='right')
     ax.set_yticklabels(corr.columns)
-    # annotate values
     for i in range(len(corr.columns)):
         for j in range(len(corr.columns)):
-            ax.text(j, i, f"{corr.values[i, j]:.2f}", ha="center", va="center", fontsize=8, color="white" if abs(corr.values[i, j]) > 0.5 else "black")
+            ax.text(j, i, f"{corr.values[i, j]:.2f}", ha="center", va="center", fontsize=8,
+                    color="white" if abs(corr.values[i, j]) > 0.5 else "black")
     fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     st.pyplot(fig)
 else:
@@ -139,9 +146,8 @@ if 'src_ip_country_code_trunc' in df.columns and 'detection_types' in df.columns
 if 'creation_time' in df.columns and not df['creation_time'].isna().all():
     st.subheader("Time Series: Bytes In / Bytes Out")
     ts_df = df.set_index('creation_time').sort_index()
-    # sample if huge
     if ts_df.shape[0] > 2000:
-        ts_df = ts_df.resample('1T').median().ffill()  # 1-minute bins (if datetime granularity allows)
+        ts_df = ts_df.resample('1T').median().ffill()
     fig3, ax3 = plt.subplots(figsize=(12, 4))
     ax3.plot(ts_df.index, ts_df['bytes_in'], label='Bytes In', marker='o', markersize=3, linewidth=1)
     ax3.plot(ts_df.index, ts_df['bytes_out'], label='Bytes Out', marker='o', markersize=3, linewidth=1)
@@ -159,18 +165,15 @@ else:
 st.header("Network Interaction Graph (source -> destination)")
 
 if 'src_ip' in df.columns and 'dst_ip' in df.columns:
-    # Build graph but limit nodes to most frequent IPs to keep visuals readable
     combined = pd.concat([df['src_ip'], df['dst_ip']])
     top_ips = combined.value_counts().nlargest(max_graph_nodes).index
     G = nx.Graph()
-    # Add edges only when both endpoints are in top_ips
     for _, row in df.iterrows():
         s = row.get('src_ip')
         d = row.get('dst_ip')
         if s in top_ips and d in top_ips:
             G.add_edge(s, d)
 
-    # Layout and draw
     if G.number_of_nodes() == 0:
         st.info("No network edges among the top IPs for the selected max node limit.")
     else:
@@ -188,21 +191,20 @@ else:
 # ---- Modeling ----
 st.header("Modeling — Random Forest (and optional Neural Net)")
 
-# Ensure required numeric columns exist
 required = ['bytes_in', 'bytes_out', 'duration_seconds', 'is_suspicious']
 if all(col in df.columns for col in required):
     X = df[['bytes_in', 'bytes_out', 'duration_seconds']].values
     y = df['is_suspicious'].values
 
-    # Train/test split
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3, random_state=random_state, stratify=y if len(np.unique(y))>1 else None)
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.3, random_state=random_state,
+        stratify=y if len(np.unique(y)) > 1 else None
+    )
 
-    # Scale
     scaler = StandardScaler()
     X_train_scaled = scaler.fit_transform(X_train)
     X_test_scaled = scaler.transform(X_test)
 
-    # Random Forest
     rf = RandomForestClassifier(n_estimators=100, random_state=random_state)
     with st.spinner("Training Random Forest..."):
         rf.fit(X_train_scaled, y_train)
@@ -213,14 +215,12 @@ if all(col in df.columns for col in required):
     st.text("Classification Report:")
     st.text(classification_report(y_test, y_pred, zero_division=0))
 
-    # Feature importances
     fi = rf.feature_importances_
     fig5, ax5 = plt.subplots(figsize=(6, 3))
     ax5.bar(['bytes_in', 'bytes_out', 'duration_seconds'], fi)
     ax5.set_title("Feature Importances (Random Forest)")
     st.pyplot(fig5)
 
-    # Optional: Train simple dense neural network (if requested & TF available)
     if train_nn and TF_AVAILABLE:
         st.subheader("Keras Dense Neural Network")
         n_features = X_train_scaled.shape[1]
@@ -238,7 +238,6 @@ if all(col in df.columns for col in required):
 
         st.write(f"NN Test Accuracy: **{acc_nn:.4f}**")
 
-        # Plot training history
         fig6, ax6 = plt.subplots(1, 2, figsize=(12, 4))
         ax6[0].plot(history.history['accuracy'], label='train')
         ax6[0].plot(history.history['val_accuracy'], label='val')
@@ -252,9 +251,10 @@ if all(col in df.columns for col in required):
         st.pyplot(fig6)
 
     if train_nn and not TF_AVAILABLE:
-        st.warning("TensorFlow is not installed in this environment. If you want to run NN training, add 'tensorflow' to requirements.txt (note: large).")
+        st.warning("TensorFlow is not installed in this environment. Add 'tensorflow' to requirements.txt if you want NN training (note: it's large).")
+
 else:
     st.warning(f"Required columns for modeling not found. Need: {required}")
 
 st.write("---")
-st.markdown("App built from your notebook — converted to Streamlit. If you want the app to automatically run training on deploy, make sure your hosting environment has enough resources (especially if you enable TensorFlow).")
+st.markdown("App reads CSV from repo path. If you want the app to load a different path, change the `DATA_PATH` variable at the top of this file.")
