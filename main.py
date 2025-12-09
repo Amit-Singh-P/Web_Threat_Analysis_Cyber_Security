@@ -1,312 +1,260 @@
+# streamlit_app.py
+import warnings
+warnings.filterwarnings("ignore")
+
 import streamlit as st
 import pandas as pd
-import seaborn as sns
-import networkx as nx
+import numpy as np
 import matplotlib.pyplot as plt
+import networkx as nx
+
 from sklearn.preprocessing import StandardScaler, OneHotEncoder
 from sklearn.model_selection import train_test_split
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import classification_report, accuracy_score
-import numpy as np
-import tensorflow as tf
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Dense, Conv1D, Flatten, Dropout
-from tensorflow.keras.optimizers import Adam
-import warnings
-warnings.filterwarnings("ignore")
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
 
-# Set page config
-st.set_page_config(page_title="Web Threat Analysis", layout="wide")
-
-# Title
-st.title("🔒 Web Threat Analysis Dashboard")
-
-# ============= PASTE YOUR CSV FILE PATH HERE =============
-CSV_FILE_PATH = "CloudWatch_Traffic_Web_Attack.csv"  # <- CHANGE THIS PATH
-# =========================================================
-
-@st.cache_data
-def load_and_preprocess_data(file_path):
-    """Load and preprocess the data"""
-    data = pd.read_csv(file_path)
-    
-    # Remove duplicate rows
-    df_unique = data.drop_duplicates()
-    
-    # Convert time-related columns to datetime format
-    df_unique['creation_time'] = pd.to_datetime(df_unique['creation_time'])
-    df_unique['end_time'] = pd.to_datetime(df_unique['end_time'])
-    df_unique['time'] = pd.to_datetime(df_unique['time'])
-    
-    # Standardize text data
-    df_unique['src_ip_country_code'] = df_unique['src_ip_country_code'].str.upper()
-    
-    # Feature engineering: Calculate duration of connection
-    df_unique['duration_seconds'] = (df_unique['end_time'] - df_unique['creation_time']).dt.total_seconds()
-    
-    # Preparing column transformations
-    scaler = StandardScaler()
-    scaled_features = scaler.fit_transform(df_unique[['bytes_in', 'bytes_out', 'duration_seconds']])
-    
-    encoder = OneHotEncoder(sparse_output=False)
-    encoded_features = encoder.fit_transform(df_unique[['src_ip_country_code']])
-    
-    # Combining transformed features
-    scaled_columns = ['scaled_bytes_in', 'scaled_bytes_out', 'scaled_duration_seconds']
-    encoded_columns = encoder.get_feature_names_out(['src_ip_country_code'])
-    
-    scaled_df = pd.DataFrame(scaled_features, columns=scaled_columns, index=df_unique.index)
-    encoded_df = pd.DataFrame(encoded_features, columns=encoded_columns, index=df_unique.index)
-    
-    transformed_df = pd.concat([df_unique, scaled_df, encoded_df], axis=1)
-    
-    return data, df_unique, transformed_df
-
-# Load data
+# Try to import tensorflow, but keep app functional if it's not installed
 try:
-    data, df_unique, transformed_df = load_and_preprocess_data(CSV_FILE_PATH)
-    st.success("✅ Data loaded successfully!")
-except Exception as e:
-    st.error(f"❌ Error loading data: {e}")
+    import tensorflow as tf
+    from tensorflow.keras.models import Sequential
+    from tensorflow.keras.layers import Dense, Dropout
+    from tensorflow.keras.optimizers import Adam
+    TF_AVAILABLE = True
+except Exception:
+    TF_AVAILABLE = False
+
+st.set_page_config(page_title="Web Threat Analysis", layout="wide")
+st.title("Web Threat Analysis — Streamlit App")
+
+# ---- Sidebar: Inputs ----
+st.sidebar.header("Upload / Settings")
+uploaded_file = st.sidebar.file_uploader("Upload CSV file (CloudWatch_Traffic_Web_Attack.csv)", type=["csv"])
+
+max_graph_nodes = st.sidebar.slider("Max nodes in network graph", min_value=20, max_value=300, value=80, step=10)
+train_nn = st.sidebar.checkbox("Also train TensorFlow Neural Network (if available)", value=False)
+if train_nn and not TF_AVAILABLE:
+    st.sidebar.warning("TensorFlow not available on the server. Neural network option will be disabled.")
+
+random_state = st.sidebar.number_input("Random seed", min_value=0, max_value=9999, value=42)
+
+# Utility: safe datetime conversion
+def safe_to_datetime(df, col):
+    if col in df.columns:
+        return pd.to_datetime(df[col], errors='coerce')
+    return pd.Series([], dtype="datetime64[ns]")
+
+# ---- Data Loading & Preprocessing ----
+@st.cache_data(show_spinner=False)
+def load_and_transform(uploaded):
+    df = pd.read_csv(uploaded)
+    # Drop duplicate rows
+    df = df.drop_duplicates().reset_index(drop=True)
+
+    # Datetime conversions (safely)
+    df['creation_time'] = safe_to_datetime(df, 'creation_time')
+    df['end_time'] = safe_to_datetime(df, 'end_time')
+    df['time'] = safe_to_datetime(df, 'time')
+
+    # Normalize text columns if present
+    if 'src_ip_country_code' in df.columns:
+        df['src_ip_country_code'] = df['src_ip_country_code'].astype(str).str.upper().replace('NONE', np.nan)
+
+    # Feature: duration
+    if 'creation_time' in df.columns and 'end_time' in df.columns:
+        df['duration_seconds'] = (df['end_time'] - df['creation_time']).dt.total_seconds()
+    else:
+        df['duration_seconds'] = np.nan
+
+    # Fill numeric NaNs for scaler stability
+    for c in ['bytes_in', 'bytes_out', 'duration_seconds']:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors='coerce').fillna(0)
+        else:
+            df[c] = 0
+
+    # One-hot encode country (keep top 10 else "OTHER")
+    if 'src_ip_country_code' in df.columns:
+        top_countries = df['src_ip_country_code'].value_counts().nlargest(10).index
+        df['src_ip_country_code_trunc'] = df['src_ip_country_code'].where(df['src_ip_country_code'].isin(top_countries), other='OTHER')
+    else:
+        df['src_ip_country_code_trunc'] = 'UNKNOWN'
+
+    # Label: is_suspicious (binary)
+    if 'detection_types' in df.columns:
+        df['is_suspicious'] = (df['detection_types'].astype(str).str.lower() == 'waf_rule').astype(int)
+    else:
+        df['is_suspicious'] = 0
+
+    return df
+
+if not uploaded_file:
+    st.info("Upload your CSV file in the sidebar to get started. Example filename: CloudWatch_Traffic_Web_Attack.csv")
     st.stop()
 
-# Sidebar
-st.sidebar.header("📊 Analysis Options")
-analysis_type = st.sidebar.selectbox(
-    "Select Analysis Type",
-    ["Data Overview", "Correlation Analysis", "Detection Types Analysis", 
-     "Traffic Over Time", "Network Graph", "Machine Learning Models"]
-)
+# Load data
+with st.spinner("Loading and processing data..."):
+    df = load_and_transform(uploaded_file)
 
-# Main content based on selection
-if analysis_type == "Data Overview":
-    st.header("📋 Data Overview")
-    
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric("Total Records", len(data))
-    with col2:
-        st.metric("Unique Records", len(df_unique))
-    with col3:
-        st.metric("Detection Types", data['detection_types'].nunique())
-    
-    st.subheader("Dataset Sample")
-    st.dataframe(df_unique.head(10))
-    
-    st.subheader("Dataset Information")
-    buffer = df_unique.describe()
-    st.dataframe(buffer)
+st.header("Raw data preview")
+st.dataframe(df.head(200))
 
-elif analysis_type == "Correlation Analysis":
-    st.header("🔗 Correlation Analysis")
-    
-    numeric_df = transformed_df.select_dtypes(include=['float64', 'int64'])
-    correlation_matrix = numeric_df.corr()
-    
-    fig, ax = plt.subplots(figsize=(12, 10))
-    sns.heatmap(correlation_matrix, annot=True, fmt=".2f", cmap='coolwarm', ax=ax)
-    ax.set_title('Correlation Matrix Heatmap')
+# ---- Exploratory plots ----
+st.header("Exploratory Visualizations")
+
+# Correlation heatmap (matplotlib; numeric fields only)
+numeric_df = df.select_dtypes(include=[np.number])
+if not numeric_df.empty:
+    corr = numeric_df.corr()
+    st.subheader("Correlation Matrix (numeric columns)")
+    fig, ax = plt.subplots(figsize=(8, 6))
+    im = ax.imshow(corr.values, aspect='auto', interpolation='none')
+    ax.set_xticks(np.arange(len(corr.columns)))
+    ax.set_yticks(np.arange(len(corr.columns)))
+    ax.set_xticklabels(corr.columns, rotation=45, ha='right')
+    ax.set_yticklabels(corr.columns)
+    # annotate values
+    for i in range(len(corr.columns)):
+        for j in range(len(corr.columns)):
+            ax.text(j, i, f"{corr.values[i, j]:.2f}", ha="center", va="center", fontsize=8, color="white" if abs(corr.values[i, j]) > 0.5 else "black")
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     st.pyplot(fig)
+else:
+    st.info("No numeric columns available for correlation matrix.")
 
-elif analysis_type == "Detection Types Analysis":
-    st.header("🎯 Detection Types by Country")
-    
-    detection_types_by_country = pd.crosstab(
-        transformed_df['src_ip_country_code'], 
-        transformed_df['detection_types']
-    )
-    
-    fig, ax = plt.subplots(figsize=(12, 6))
-    detection_types_by_country.plot(kind='bar', stacked=True, ax=ax)
-    ax.set_title('Detection Types by Country Code')
-    ax.set_xlabel('Country Code')
-    ax.set_ylabel('Frequency of Detection Types')
-    ax.tick_params(axis='x', rotation=45)
-    ax.legend(title='Detection Type')
-    st.pyplot(fig)
+# Stacked bar chart: detection_types by country (truncated)
+if 'src_ip_country_code_trunc' in df.columns and 'detection_types' in df.columns:
+    st.subheader("Detection Types by Country (top countries + OTHER)")
+    ctab = pd.crosstab(df['src_ip_country_code_trunc'], df['detection_types'])
+    fig2, ax2 = plt.subplots(figsize=(10, 5))
+    ctab.plot(kind='bar', stacked=True, ax=ax2)
+    ax2.set_xlabel('Country Code (truncated)')
+    ax2.set_ylabel('Count')
+    ax2.set_title('Detection Types by Country')
+    ax2.legend(title='Detection Type', bbox_to_anchor=(1.02, 1), loc='upper left')
+    st.pyplot(fig2)
 
-elif analysis_type == "Traffic Over Time":
-    st.header("📈 Web Traffic Analysis Over Time")
-    
-    data_time = data.copy()
-    data_time['creation_time'] = pd.to_datetime(data_time['creation_time'])
-    data_time.set_index('creation_time', inplace=True)
-    
-    fig, ax = plt.subplots(figsize=(12, 6))
-    ax.plot(data_time.index, data_time['bytes_in'], label='Bytes In', marker='o')
-    ax.plot(data_time.index, data_time['bytes_out'], label='Bytes Out', marker='o')
-    ax.set_title('Web Traffic Analysis Over Time')
-    ax.set_xlabel('Time')
-    ax.set_ylabel('Bytes')
-    ax.legend()
-    ax.grid(True)
-    plt.xticks(rotation=45)
-    plt.tight_layout()
-    st.pyplot(fig)
+# Time-series: bytes_in and bytes_out over time if time index exists
+if 'creation_time' in df.columns and not df['creation_time'].isna().all():
+    st.subheader("Time Series: Bytes In / Bytes Out")
+    ts_df = df.set_index('creation_time').sort_index()
+    # sample if huge
+    if ts_df.shape[0] > 2000:
+        ts_df = ts_df.resample('1T').median().ffill()  # 1-minute bins (if datetime granularity allows)
+    fig3, ax3 = plt.subplots(figsize=(12, 4))
+    ax3.plot(ts_df.index, ts_df['bytes_in'], label='Bytes In', marker='o', markersize=3, linewidth=1)
+    ax3.plot(ts_df.index, ts_df['bytes_out'], label='Bytes Out', marker='o', markersize=3, linewidth=1)
+    ax3.set_xlabel("Time")
+    ax3.set_ylabel("Bytes")
+    ax3.set_title("Web Traffic Over Time")
+    ax3.legend()
+    ax3.grid(True)
+    fig3.autofmt_xdate()
+    st.pyplot(fig3)
+else:
+    st.info("No valid 'creation_time' column present for time series plot.")
 
-elif analysis_type == "Network Graph":
-    st.header("🌐 Network Interaction Graph")
-    
-    sample_size = st.sidebar.slider("Sample Size (for performance)", 10, min(500, len(data)), 100)
-    
+# ---- Network graph (trimmed) ----
+st.header("Network Interaction Graph (source -> destination)")
+
+if 'src_ip' in df.columns and 'dst_ip' in df.columns:
+    # Build graph but limit nodes to most frequent IPs to keep visuals readable
+    combined = pd.concat([df['src_ip'], df['dst_ip']])
+    top_ips = combined.value_counts().nlargest(max_graph_nodes).index
     G = nx.Graph()
-    data_sample = data.head(sample_size)
-    
-    for idx, row in data_sample.iterrows():
-        G.add_edge(row['src_ip'], row['dst_ip'])
-    
-    fig, ax = plt.subplots(figsize=(14, 10))
-    nx.draw_networkx(G, with_labels=True, node_size=20, font_size=8, 
-                     node_color='skyblue', font_color='darkblue', ax=ax)
-    ax.set_title('Network Interaction between Source and Destination IPs')
-    ax.axis('off')
-    st.pyplot(fig)
+    # Add edges only when both endpoints are in top_ips
+    for _, row in df.iterrows():
+        s = row.get('src_ip')
+        d = row.get('dst_ip')
+        if s in top_ips and d in top_ips:
+            G.add_edge(s, d)
 
-elif analysis_type == "Machine Learning Models":
-    st.header("🤖 Machine Learning Models")
-    
-    model_choice = st.sidebar.selectbox(
-        "Select Model",
-        ["Random Forest", "Neural Network (Simple)", "Neural Network (Advanced)", "CNN Model"]
-    )
-    
-    # Prepare data
-    transformed_df['is_suspicious'] = (transformed_df['detection_types'] == 'waf_rule').astype(int)
-    
-    if model_choice == "Random Forest":
-        st.subheader("🌲 Random Forest Classifier")
-        
-        X = transformed_df[['bytes_in', 'bytes_out', 'scaled_duration_seconds']]
-        y = transformed_df['is_suspicious']
-        
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3, random_state=42)
-        
-        with st.spinner("Training Random Forest..."):
-            rf_classifier = RandomForestClassifier(n_estimators=100, random_state=42)
-            rf_classifier.fit(X_train, y_train)
-            y_pred = rf_classifier.predict(X_test)
-            
-            accuracy = accuracy_score(y_test, y_pred)
-            classification = classification_report(y_test, y_pred)
-            
-            col1, col2 = st.columns(2)
-            with col1:
-                st.metric("Model Accuracy", f"{accuracy:.2%}")
-            
-            st.text("Classification Report:")
-            st.text(classification)
-    
-    else:  # Neural Network models
-        data_ml = data.copy()
-        data_ml['is_suspicious'] = (data_ml['detection_types'] == 'waf_rule').astype(int)
-        
-        X = data_ml[['bytes_in', 'bytes_out']].values
-        y = data_ml['is_suspicious'].values
-        
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3, random_state=42)
-        
-        scaler = StandardScaler()
-        X_train_scaled = scaler.fit_transform(X_train)
-        X_test_scaled = scaler.transform(X_test)
-        
-        if model_choice == "Neural Network (Simple)":
-            st.subheader("🧠 Simple Neural Network")
-            
-            model = Sequential([
-                Dense(8, activation='relu', input_shape=(X_train_scaled.shape[1],)),
-                Dense(16, activation='relu'),
-                Dense(1, activation='sigmoid')
-            ])
-            
-            model.compile(optimizer=Adam(), loss='binary_crossentropy', metrics=['accuracy'])
-            
-            with st.spinner("Training model..."):
-                history = model.fit(X_train_scaled, y_train, epochs=10, batch_size=8, verbose=0)
-                loss, accuracy = model.evaluate(X_test_scaled, y_test, verbose=0)
-                
-                st.metric("Test Accuracy", f"{accuracy*100:.2f}%")
-        
-        elif model_choice == "Neural Network (Advanced)":
-            st.subheader("🧠 Advanced Neural Network with Dropout")
-            
-            model = Sequential([
-                Dense(128, activation='relu', input_shape=(X_train_scaled.shape[1],)),
-                Dropout(0.5),
-                Dense(128, activation='relu'),
-                Dropout(0.5),
-                Dense(1, activation='sigmoid')
-            ])
-            
-            model.compile(optimizer=Adam(), loss='binary_crossentropy', metrics=['accuracy'])
-            
-            with st.spinner("Training model..."):
-                history = model.fit(X_train_scaled, y_train, epochs=10, batch_size=32, 
-                                  verbose=0, validation_split=0.2)
-                loss, accuracy = model.evaluate(X_test_scaled, y_test, verbose=0)
-                
-                st.metric("Test Accuracy", f"{accuracy*100:.2f}%")
-                
-                # Plot training history
-                fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
-                
-                ax1.plot(history.history['accuracy'], label='Training Accuracy')
-                ax1.plot(history.history['val_accuracy'], label='Validation Accuracy')
-                ax1.set_title('Model Accuracy')
-                ax1.set_xlabel('Epoch')
-                ax1.set_ylabel('Accuracy')
-                ax1.legend()
-                
-                ax2.plot(history.history['loss'], label='Training Loss')
-                ax2.plot(history.history['val_loss'], label='Validation Loss')
-                ax2.set_title('Model Loss')
-                ax2.set_xlabel('Epoch')
-                ax2.set_ylabel('Loss')
-                ax2.legend()
-                
-                st.pyplot(fig)
-        
-        elif model_choice == "CNN Model":
-            st.subheader("🔷 CNN Model")
-            
-            X_train_cnn = X_train_scaled.reshape(X_train_scaled.shape[0], X_train_scaled.shape[1], 1)
-            X_test_cnn = X_test_scaled.reshape(X_test_scaled.shape[0], X_test_scaled.shape[1], 1)
-            
-            model = Sequential([
-                Conv1D(32, kernel_size=1, activation='relu', input_shape=(X_train_cnn.shape[1], 1)),
-                Flatten(),
-                Dense(64, activation='relu'),
-                Dropout(0.5),
-                Dense(1, activation='sigmoid')
-            ])
-            
-            model.compile(optimizer=Adam(), loss='binary_crossentropy', metrics=['accuracy'])
-            
-            with st.spinner("Training CNN model..."):
-                history = model.fit(X_train_cnn, y_train, epochs=10, batch_size=32, 
-                                  verbose=0, validation_split=0.2)
-                loss, accuracy = model.evaluate(X_test_cnn, y_test, verbose=0)
-                
-                st.metric("Test Accuracy", f"{accuracy*100:.2f}%")
-                
-                # Plot training history
-                fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
-                
-                ax1.plot(history.history['accuracy'], label='Training Accuracy')
-                ax1.plot(history.history['val_accuracy'], label='Validation Accuracy')
-                ax1.set_title('Model Accuracy')
-                ax1.set_xlabel('Epoch')
-                ax1.set_ylabel('Accuracy')
-                ax1.legend()
-                
-                ax2.plot(history.history['loss'], label='Training Loss')
-                ax2.plot(history.history['val_loss'], label='Validation Loss')
-                ax2.set_title('Model Loss')
-                ax2.set_xlabel('Epoch')
-                ax2.set_ylabel('Loss')
-                ax2.legend()
-                
-                st.pyplot(fig)
+    # Layout and draw
+    if G.number_of_nodes() == 0:
+        st.info("No network edges among the top IPs for the selected max node limit.")
+    else:
+        fig4, ax4 = plt.subplots(figsize=(12, 8))
+        pos = nx.spring_layout(G, k=0.15, iterations=20, seed=random_state)
+        nx.draw_networkx_nodes(G, pos, node_size=50, ax=ax4)
+        nx.draw_networkx_edges(G, pos, alpha=0.4, ax=ax4)
+        nx.draw_networkx_labels(G, pos, font_size=7, ax=ax4)
+        ax4.set_title("Trimmed Network Graph (top IPs)")
+        ax4.axis('off')
+        st.pyplot(fig4)
+else:
+    st.info("Missing 'src_ip' or 'dst_ip' columns for network graph.")
 
-# Footer
-st.sidebar.markdown("---")
-st.sidebar.info("💡 Web Threat Analysis Dashboard - Analyzing CloudWatch Traffic Data")
+# ---- Modeling ----
+st.header("Modeling — Random Forest (and optional Neural Net)")
+
+# Ensure required numeric columns exist
+required = ['bytes_in', 'bytes_out', 'duration_seconds', 'is_suspicious']
+if all(col in df.columns for col in required):
+    X = df[['bytes_in', 'bytes_out', 'duration_seconds']].values
+    y = df['is_suspicious'].values
+
+    # Train/test split
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3, random_state=random_state, stratify=y if len(np.unique(y))>1 else None)
+
+    # Scale
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_test_scaled = scaler.transform(X_test)
+
+    # Random Forest
+    rf = RandomForestClassifier(n_estimators=100, random_state=random_state)
+    with st.spinner("Training Random Forest..."):
+        rf.fit(X_train_scaled, y_train)
+        y_pred = rf.predict(X_test_scaled)
+    acc = accuracy_score(y_test, y_pred)
+    st.subheader("Random Forest Results")
+    st.write(f"Accuracy: **{acc:.4f}**")
+    st.text("Classification Report:")
+    st.text(classification_report(y_test, y_pred, zero_division=0))
+
+    # Feature importances
+    fi = rf.feature_importances_
+    fig5, ax5 = plt.subplots(figsize=(6, 3))
+    ax5.bar(['bytes_in', 'bytes_out', 'duration_seconds'], fi)
+    ax5.set_title("Feature Importances (Random Forest)")
+    st.pyplot(fig5)
+
+    # Optional: Train simple dense neural network (if requested & TF available)
+    if train_nn and TF_AVAILABLE:
+        st.subheader("Keras Dense Neural Network")
+        n_features = X_train_scaled.shape[1]
+        model = Sequential([
+            Dense(32, activation='relu', input_shape=(n_features,)),
+            Dropout(0.3),
+            Dense(16, activation='relu'),
+            Dropout(0.2),
+            Dense(1, activation='sigmoid')
+        ])
+        model.compile(optimizer=Adam(learning_rate=0.001), loss='binary_crossentropy', metrics=['accuracy'])
+        with st.spinner("Training neural network (this may take several seconds)..."):
+            history = model.fit(X_train_scaled, y_train, epochs=20, batch_size=32, validation_split=0.2, verbose=0)
+            loss, acc_nn = model.evaluate(X_test_scaled, y_test, verbose=0)
+
+        st.write(f"NN Test Accuracy: **{acc_nn:.4f}**")
+
+        # Plot training history
+        fig6, ax6 = plt.subplots(1, 2, figsize=(12, 4))
+        ax6[0].plot(history.history['accuracy'], label='train')
+        ax6[0].plot(history.history['val_accuracy'], label='val')
+        ax6[0].set_title("NN Accuracy")
+        ax6[0].legend()
+
+        ax6[1].plot(history.history['loss'], label='train')
+        ax6[1].plot(history.history['val_loss'], label='val')
+        ax6[1].set_title("NN Loss")
+        ax6[1].legend()
+        st.pyplot(fig6)
+
+    if train_nn and not TF_AVAILABLE:
+        st.warning("TensorFlow is not installed in this environment. If you want to run NN training, add 'tensorflow' to requirements.txt (note: large).")
+else:
+    st.warning(f"Required columns for modeling not found. Need: {required}")
+
+st.write("---")
+st.markdown("App built from your notebook — converted to Streamlit. If you want the app to automatically run training on deploy, make sure your hosting environment has enough resources (especially if you enable TensorFlow).")
